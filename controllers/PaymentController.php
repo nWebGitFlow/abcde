@@ -15,6 +15,8 @@ use yii\web\UploadedFile;
 use PHPExcel;
 use PHPExcel_IOFactory;
 use PHPExcel_Settings;
+use SoapClient;
+use DOMDocument;
 
 
 /**
@@ -22,6 +24,27 @@ use PHPExcel_Settings;
  */
 class PaymentController extends Controller
 {
+    /**
+     * Список данных с телефонными номерами для СМС-рассылки
+     */
+    private $tel_list = array();
+
+    /**
+     * websms SOAP-client
+     */
+    private $client;
+
+    /**
+     * websms registration data
+     */
+    private $username;
+    private $password;
+
+    /**
+     * websms sender phone number 
+     */
+    private $fromNumber;
+
     /**
      * {@inheritdoc}
      */
@@ -133,20 +156,43 @@ class PaymentController extends Controller
         throw new NotFoundHttpException('The requested page does not exist.');
     }
 
-    // /**
-    //  * Get Payments from excel-file.
-    //  * @return mixed
-    //  */
-    // public function actionLoad()
-    // {
-    //     $searchModel = new PaymentSearch();
-    //     $dataProvider = $searchModel->search(Yii::$app->request->queryParams);
+
+    /**
+     * Constract simplexml-object from xml-string.
+     */
+    public function getXML($inputStr)
+    {
+        $dom = new DOMDocument;
+        $dom->loadXML($inputStr);
+        if (!$dom) {
+            die('Ошибка при попытке разбора строки: '.PHP_EOL.$inputStr);
+        }
+        
+        // return $dom->saveHTML(); // выводим (echo) XML как есть
+        // return htmlspecialchars($dom->saveHTML()); // выводим (echo) XML как текст
+        return simplexml_import_dom($dom);  // выводим (var_dump) XML как объект
+    }
+
+    /**
+     * Initialize SOAP-client to websms-service.
+     */
+    private function initSoap()
+    {
+        $this->client = new SoapClient(
+            "http://smpp3.websms.ru:8181/soap?WSDL" 
+        );
+        $regs = require '../config/input_websms.php';
+        $this->username = $regs['username'];
+        $this->password = $regs['password'];
+        // телефонный номер отправителя должен быть извлечён из базы данных 
+        $this->fromNumber = '79001234567'; 
+    }
 
 
     /**
      * Read Payments from excel-file only with e-mail.
      */
-    public function actionImportExcel($inputFile) {
+    public function importExcel($inputFile) {
         try {
             // $inputFileType = \PHPExcel_IOFactory::indentify($inputFile);
             // Создаем объект класса PHPExcel
@@ -181,17 +227,31 @@ class PaymentController extends Controller
             $rowData = $sheet->rangeToArray('A'.$row.':'.$highestColumn.$row, NULL, TRUE, FALSE);
             // var_dump($res);
             // die('Ok! ');
-            // проверка на входение признака почтового адреса
+            // проверка на входение признака почтового адреса и составление выходного массива с e-mail-адресами
             if (strpos($rowData[0][0], '@')>0){
                 // var_dump($rowData[0][0]);
                 // сохранение строки
                 $res[] = $rowData[0]; 
+            } else {
+                // проверка на признак телефонного номера и составление публичного массива с телефонными номерами
+                $number = $rowData[0][0];
+
+                $to_number = preg_replace("/[^0-9]/", '', $number); 
+                if (strlen($to_number)==11) {
+                    $this->tel_list[] = $rowData[0]; 
+                }
+
+                
             }
 
         }
+        // var_dump($this->tel_list);
+        // die('Ok! ');
 
         try {
             // здесь надо отсоединиться от excel-файла, иначе он не удалится
+            $objPHPExcel->disconnectWorksheets();
+            unset($objPHPExcel);
         }catch(Exception $e){
             die('Error – '.$inputFile);
         }
@@ -201,11 +261,6 @@ class PaymentController extends Controller
         return $res;
     }
 
-    //     return $this->render('index', [
-    //         'searchModel' => $searchModel,
-    //         'dataProvider' => $dataProvider,
-    //     ]);
-    // }
 
     /**
      * Upload Payments from excel-file.
@@ -226,7 +281,7 @@ class PaymentController extends Controller
             // return $this->render('excel', ['model'=>$model]);
             if (file_exists($model->getFolder().$fileName)){
                 // считать данные из excel-файла
-                $res = $this->actionImportExcel($model->getFolder().$fileName);
+                $res = $this->importExcel($model->getFolder().$fileName);
 
                 // загрузить данные в базу данных
 
@@ -254,16 +309,53 @@ class PaymentController extends Controller
                     // сохраняем запись
                     $modelPay->save();  
                 }
-            // foreach ($ss as $val2) { //date
-            //     if (($date_1 < ($val2['Date'])) && ($out == $val2['From'])) {
-            //         $inputs1[$i][] = $val2;
-            //         // $j++;
-            //         $last_puthes = count($puthes) - 1;
-            //         $puthes = recurs($puthes, $bak_puth, $val2, $ss);
-            //     }
-            // };
 
-                // удалить файл
+
+
+                /**
+                 * Инициализация доступа к web-сервису СМС–рассылок
+                 */
+                $this->initSoap();
+
+                /**
+                 * Разбор списка телефонных адресов для СМС-рассылки
+                 * (список не должен быть большой, иначе он будет долго обрабатываться
+                 * web-сервисом СМС-рассылок)
+                 * 
+                 * Здесь обнуляется массив $tel_list
+                 */
+
+                $saldo = 0;
+                while (count($this->tel_list)>0) {
+                    $recieve_tel_data = array_pop($this->tel_list);
+                    $number = $recieve_tel_data[0]; // номер телефона
+                    $saldo = $this->client->getBalance($this->username, $this->password); 
+                        // var_dump($saldo);
+                    $xSaldo = $this->getXML($saldo);
+                    $balance = (float)$xSaldo->balance;
+                    // var_dump($balance);
+
+                    // контролируем сумму на нашем балансе 
+                    // здесь может быть интегрирована бизнес-логика обработки ситуации с недостатком средств на счёте оператора web-сервиса
+                    if ($balance<1.0) {
+                        // die('<br />Cancel ');
+                        $this->tel_list = array();
+                        break;
+                    }
+                    // die('<br />Ok! ');
+                    // строим сообщение для его отправки на телефон клиента
+                    $message = "На ваш счёт поступило ".$recieve_tel_data[1].$recieve_tel_data[2];
+                    // непосредственная отсылка СМС-сообщения с получением статуса исполнения команды
+                    $sendStatus = $this->client->sendSMS($this->username, $this->password, $this->fromNumber, $message, $number);
+
+                    // трансформируем ответ от web-сервиса websms в объект
+                    $xSendStatus = $this->getXML($sendStatus);
+                    // здесь должна быть реализована какая-либо обработка статуса отправки СМС-сообщения
+                    // var_dump($xSendStatus);
+                    // die('Ok! ');
+                } 
+
+                // удалить excel-файл 
                 unlink($model->getFolder().$fileName);
                 // var_dump($res);
                 // die('Ok! ');
